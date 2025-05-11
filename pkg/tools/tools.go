@@ -28,6 +28,13 @@ import (
 	"github.com/google/uuid"
 )
 
+type ContextKey string
+
+const (
+	KubeconfigKey ContextKey = "kubeconfig"
+	WorkDirKey    ContextKey = "work_dir"
+)
+
 func Lookup(name string) Tool {
 	return allTools.Lookup(name)
 }
@@ -137,8 +144,8 @@ func (t *ToolCall) InvokeTool(ctx context.Context, opt InvokeToolOptions) (any, 
 		},
 	})
 
-	ctx = context.WithValue(ctx, "kubeconfig", opt.Kubeconfig)
-	ctx = context.WithValue(ctx, "work_dir", opt.WorkDir)
+	ctx = context.WithValue(ctx, KubeconfigKey, opt.Kubeconfig)
+	ctx = context.WithValue(ctx, WorkDirKey, opt.WorkDir)
 
 	response, err := t.tool.Run(ctx, t.arguments)
 

@@ -18,7 +18,7 @@ echo "Writing results to ${OUTPUT_DIR}"
 BINDIR="${REPO_ROOT}/.build/bin"
 mkdir -p "${BINDIR}"
 
-cd "${REPO_ROOT}"
+cd "${REPO_ROOT}/cmd"
 go build -o "${BINDIR}/kubectl-ai" .
 
 cd "${REPO_ROOT}/k8s-bench"
