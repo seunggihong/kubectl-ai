@@ -78,16 +78,20 @@ type Options struct {
 	EnableToolUseShim bool `json:"enableToolUseShim,omitempty"`
 	// Quiet flag indicates if the agent should run in non-interactive mode.
 	// It requires a query to be provided as a positional argument.
-	Quiet                  bool   `json:"quiet,omitempty"`
-	MCPServer              bool   `json:"mcpServer,omitempty"`
-	MaxIterations          int    `json:"maxIterations,omitempty"`
-	KubeConfigPath         string `json:"kubeConfigPath,omitempty"`
-	PromptTemplateFilePath string `json:"promptTemplateFilePath,omitempty"`
-	TracePath              string `json:"tracePath,omitempty"`
-	RemoveWorkDir          bool   `json:"removeWorkDir,omitempty"`
+	Quiet                  bool     `json:"quiet,omitempty"`
+	MCPServer              bool     `json:"mcpServer,omitempty"`
+	MaxIterations          int      `json:"maxIterations,omitempty"`
+	KubeConfigPath         string   `json:"kubeConfigPath,omitempty"`
+	PromptTemplateFilePath string   `json:"promptTemplateFilePath,omitempty"`
+	ExtraPromptPaths       []string `json:"extraPromptPaths,omitempty"`
+	TracePath              string   `json:"tracePath,omitempty"`
+	RemoveWorkDir          bool     `json:"removeWorkDir,omitempty"`
 
 	// UserInterface is the type of user interface to use.
 	UserInterface UserInterface `json:"userInterface,omitempty"`
+
+	// SkipVerifySSL is a flag to skip verifying the SSL certificate of the LLM provider.
+	SkipVerifySSL bool `json:"skipVerifySSL,omitempty"`
 }
 
 type UserInterface string
@@ -130,11 +134,15 @@ func (o *Options) InitDefaults() {
 	o.MaxIterations = 20
 	o.KubeConfigPath = ""
 	o.PromptTemplateFilePath = ""
+	o.ExtraPromptPaths = []string{}
 	o.TracePath = filepath.Join(os.TempDir(), "kubectl-ai-trace.txt")
 	o.RemoveWorkDir = false
 
 	// Default to terminal UI
 	o.UserInterface = UserInterfaceTerminal
+
+	// Default to not skipping SSL verification
+	o.SkipVerifySSL = false
 }
 
 func (o *Options) LoadConfiguration(b []byte) error {
@@ -251,6 +259,7 @@ func (opt *Options) bindCLIFlags(f *pflag.FlagSet) error {
 	f.IntVar(&opt.MaxIterations, "max-iterations", opt.MaxIterations, "maximum number of iterations agent will try before giving up")
 	f.StringVar(&opt.KubeConfigPath, "kubeconfig", opt.KubeConfigPath, "path to kubeconfig file")
 	f.StringVar(&opt.PromptTemplateFilePath, "prompt-template-file-path", opt.PromptTemplateFilePath, "path to custom prompt template file")
+	f.StringArrayVar(&opt.ExtraPromptPaths, "extra-prompt-paths", opt.ExtraPromptPaths, "extra prompt template paths")
 	f.StringVar(&opt.TracePath, "trace-path", opt.TracePath, "path to the trace file")
 	f.BoolVar(&opt.RemoveWorkDir, "remove-workdir", opt.RemoveWorkDir, "remove the temporary working directory after execution")
 
@@ -262,37 +271,47 @@ func (opt *Options) bindCLIFlags(f *pflag.FlagSet) error {
 	f.BoolVar(&opt.Quiet, "quiet", opt.Quiet, "run in non-interactive mode, requires a query to be provided as a positional argument")
 
 	f.Var(&opt.UserInterface, "user-interface", "user interface mode to use")
+	f.BoolVar(&opt.SkipVerifySSL, "skip-verify-ssl", opt.SkipVerifySSL, "skip verifying the SSL certificate of the LLM provider")
 
 	return nil
 }
 
 func RunRootCommand(ctx context.Context, opt Options, args []string) error {
+	var err error // Declare err once for the whole function
+
 	// resolve kubeconfig path with priority: flag/env > KUBECONFIG > default path
-	if err := resolveKubeConfigPath(&opt); err != nil {
+	if err = resolveKubeConfigPath(&opt); err != nil {
 		return fmt.Errorf("failed to resolve kubeconfig path: %w", err)
 	}
 
 	if opt.MCPServer {
-		if err := startMCPServer(ctx, opt); err != nil {
+		if err = startMCPServer(ctx, opt); err != nil {
 			return fmt.Errorf("failed to start MCP server: %w", err)
 		}
 	}
 
 	// After reading stdin, it is consumed
-	hasStdInData, err := hasStdInData()
+	var hasInputData bool
+	hasInputData, err = hasStdInData()
 	if err != nil {
 		return fmt.Errorf("failed to check if stdin has data: %w", err)
 	}
 
 	// Handles positional args or stdin
-	queryFromCmd, err := resolveQueryInput(hasStdInData, args)
+	var queryFromCmd string
+	queryFromCmd, err = resolveQueryInput(hasInputData, args)
 	if err != nil {
 		return fmt.Errorf("failed to resolve query input %w", err)
 	}
 
 	klog.Info("Application started", "pid", os.Getpid())
 
-	llmClient, err := gollm.NewClient(ctx, opt.ProviderID)
+	var llmClient gollm.Client
+	if opt.SkipVerifySSL {
+		llmClient, err = gollm.NewClient(ctx, opt.ProviderID, gollm.WithSkipVerifySSL())
+	} else {
+		llmClient, err = gollm.NewClient(ctx, opt.ProviderID)
+	}
 	if err != nil {
 		return fmt.Errorf("creating llm client: %w", err)
 	}
@@ -300,7 +319,8 @@ func RunRootCommand(ctx context.Context, opt Options, args []string) error {
 
 	var recorder journal.Recorder
 	if opt.TracePath != "" {
-		fileRecorder, err := journal.NewFileRecorder(opt.TracePath)
+		var fileRecorder journal.Recorder
+		fileRecorder, err = journal.NewFileRecorder(opt.TracePath)
 		if err != nil {
 			return fmt.Errorf("creating trace recorder: %w", err)
 		}
@@ -318,24 +338,29 @@ func RunRootCommand(ctx context.Context, opt Options, args []string) error {
 	switch opt.UserInterface {
 	case UserInterfaceTerminal:
 		// since stdin is already consumed, we use TTY for taking input from user
-		useTTYForInput := hasStdInData
+		useTTYForInput := hasInputData
 
-		u, err := ui.NewTerminalUI(doc, recorder, useTTYForInput)
+		var u ui.UI
+		u, err = ui.NewTerminalUI(doc, recorder, useTTYForInput)
 		if err != nil {
 			return err
 		}
 		userInterface = u
 
 	case UserInterfaceHTML:
-		u, err := html.NewHTMLUserInterface(doc, recorder)
+		var u ui.UI
+		u, err = html.NewHTMLUserInterface(doc, recorder)
 		if err != nil {
 			return err
 		}
-		go func() {
-			if err := u.RunServer(ctx); err != nil {
-				klog.Fatalf("error running http server: %v", err)
-			}
-		}()
+		// Only run server if the UI is actually an HTML UI
+		if htmlUI, ok := u.(*html.HTMLUserInterface); ok {
+			go func() {
+				if err := htmlUI.RunServer(ctx); err != nil {
+					klog.Fatalf("error running http server: %v", err)
+				}
+			}()
+		}
 		userInterface = u
 
 	default:
@@ -348,6 +373,7 @@ func RunRootCommand(ctx context.Context, opt Options, args []string) error {
 		LLM:                llmClient,
 		MaxIterations:      opt.MaxIterations,
 		PromptTemplateFile: opt.PromptTemplateFilePath,
+		ExtraPromptPaths:   opt.ExtraPromptPaths,
 		Tools:              tools.Default(),
 		Recorder:           recorder,
 		RemoveWorkDir:      opt.RemoveWorkDir,
@@ -579,7 +605,7 @@ func resolveKubeConfigPath(opt *Options) error {
 
 func startMCPServer(ctx context.Context, opt Options) error {
 	workDir := filepath.Join(os.TempDir(), "kubectl-ai-mcp")
-	if err := os.MkdirAll(workDir, 0755); err != nil {
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
 		return fmt.Errorf("error creating work directory: %w", err)
 	}
 	mcpServer, err := newKubectlMCPServer(ctx, opt.KubeConfigPath, tools.Default(), workDir)

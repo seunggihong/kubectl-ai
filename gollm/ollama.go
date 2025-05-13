@@ -18,9 +18,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/url"
 
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/envconfig"
 	"k8s.io/klog/v2"
 )
 
@@ -30,8 +30,10 @@ func init() {
 	}
 }
 
-func ollamaFactory(ctx context.Context, u *url.URL) (Client, error) {
-	return NewOllamaClient(ctx)
+// ollamaFactory is the provider factory function for Ollama.
+// Supports ClientOptions for custom configuration, including skipVerifySSL.
+func ollamaFactory(ctx context.Context, opts ClientOptions) (Client, error) {
+	return NewOllamaClient(ctx, opts)
 }
 
 const (
@@ -51,11 +53,12 @@ type OllamaChat struct {
 
 var _ Client = &OllamaClient{}
 
-func NewOllamaClient(ctx context.Context) (*OllamaClient, error) {
-	client, err := api.ClientFromEnvironment()
-	if err != nil {
-		return nil, err
-	}
+// NewOllamaClient creates a new client for Ollama.
+// Supports custom HTTP client and skipVerifySSL via ClientOptions if the SDK supports it.
+func NewOllamaClient(ctx context.Context, opts ClientOptions) (*OllamaClient, error) {
+	// Create custom HTTP client with SSL verification option from client options
+	httpClient := createCustomHTTPClient(opts.SkipVerifySSL)
+	client := api.NewClient(envconfig.Host(), httpClient)
 
 	return &OllamaClient{
 		client: client,

@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 
 	openai "github.com/openai/openai-go"
@@ -27,16 +26,42 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// Register the OpenAI provider factory on package initialization.
+// Package-level env var storage (OpenAI env)
+var (
+	openAIAPIKey   string
+	openAIEndpoint string
+	openAIAPIBase  string
+	openAIModel    string
+)
+
+// init reads and caches OpenAI environment variables:
+//   - OPENAI_API_KEY, OPENAI_ENDPOINT, OPENAI_API_BASE, OPENAI_MODEL
+//
+// These serve as defaults; the model can be overridden by the Cobra --model flag.
+// After loading env values, it registers the OpenAI provider factory.
 func init() {
+	// Load environment variables
+	openAIAPIKey = os.Getenv("OPENAI_API_KEY")
+	openAIEndpoint = os.Getenv("OPENAI_ENDPOINT")
+	openAIAPIBase = os.Getenv("OPENAI_API_BASE")
+	openAIModel = os.Getenv("OPENAI_MODEL")
+
+	// Register "openai" as the provider ID
 	if err := RegisterProvider("openai", newOpenAIClientFactory); err != nil {
 		klog.Fatalf("Failed to register openai provider: %v", err)
+	}
+
+	// Also register with any aliases defined in config
+	aliases := []string{"openai-compatible"}
+	for _, alias := range aliases {
+		if err := RegisterProvider(alias, newOpenAIClientFactory); err != nil {
+			klog.Warningf("Failed to register openai provider alias %q: %v", alias, err)
+		}
 	}
 }
 
 // newOpenAIClientFactory is the factory function for creating OpenAI clients.
-func newOpenAIClientFactory(ctx context.Context, _ *url.URL) (Client, error) {
-	// The URL is not currently used for OpenAI config, relies on env vars.
+func newOpenAIClientFactory(ctx context.Context, _ ClientOptions) (Client, error) {
 	return NewOpenAIClient(ctx)
 }
 
@@ -48,26 +73,50 @@ type OpenAIClient struct {
 // Ensure OpenAIClient implements the Client interface.
 var _ Client = &OpenAIClient{}
 
-// NewOpenAIClient creates a new client for interacting with OpenAI.
-// It reads the API key and optional endpoint from environment variables
-// OPENAI_API_KEY and OPENAI_ENDPOINT.
-func NewOpenAIClient(ctx context.Context) (*OpenAIClient, error) {
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	if apiKey == "" {
-		// The NewClient might handle this, but explicit check is safer
-		return nil, errors.New("OPENAI_API_KEY environment variable not set")
+// getOpenAIModel returns the appropriate model based on configuration and explicitly provided model name
+func getOpenAIModel(model string) string {
+	// If explicit model is provided, use it
+	if model != "" {
+		klog.V(2).Infof("Using explicitly provided model: %s", model)
+		return model
 	}
 
-	endpoint := os.Getenv("OPENAI_ENDPOINT")
-	if endpoint != "" {
-		klog.Infof("Using custom OpenAI endpoint: %s", endpoint)
-		return &OpenAIClient{
-			client: openai.NewClient(option.WithBaseURL(endpoint)),
-		}, nil
+	// Check configuration
+	configModel := openAIModel
+	if configModel != "" {
+		klog.V(1).Infof("Using model from config: %s", configModel)
+		return configModel
+	}
+
+	// Default model as fallback
+	klog.V(2).Info("No model specified, defaulting to gpt-4.1")
+	return "gpt-4.1"
+}
+
+// NewOpenAIClient creates a new client for interacting with OpenAI.
+func NewOpenAIClient(ctx context.Context) (*OpenAIClient, error) {
+	// Get API key from loaded env var
+	apiKey := openAIAPIKey
+	if apiKey == "" {
+		return nil, errors.New("OpenAI API key not found. Set via OPENAI_API_KEY env var")
+	}
+
+	// Set options for client creation
+	options := []option.RequestOption{option.WithAPIKey(apiKey)}
+
+	// Check for custom endpoint or API base URL
+	baseURL := openAIEndpoint
+	if baseURL == "" {
+		baseURL = openAIAPIBase
+	}
+
+	if baseURL != "" {
+		klog.Infof("Using custom OpenAI base URL: %s", baseURL)
+		options = append(options, option.WithBaseURL(baseURL))
 	}
 
 	return &OpenAIClient{
-		client: openai.NewClient(),
+		client: openai.NewClient(options...),
 	}, nil
 }
 
@@ -79,12 +128,11 @@ func (c *OpenAIClient) Close() error {
 
 // StartChat starts a new chat session.
 func (c *OpenAIClient) StartChat(systemPrompt, model string) Chat {
-	// Default to gpt-4o if no model is specified or if it doesn't look like a known OpenAI prefix
-	if model == "" {
-		model = "gpt-4o"
-		klog.V(1).Info("No model specified, defaulting to gpt-4o")
-	}
-	klog.V(1).Infof("Starting new OpenAI chat session with model: %s", model)
+	// Get the model to use for this chat
+	selectedModel := getOpenAIModel(model)
+
+	klog.V(1).Infof("Starting new OpenAI chat session with model: %s", selectedModel)
+
 	// Initialize history with system prompt if provided
 	history := []openai.ChatCompletionMessageParamUnion{}
 	if systemPrompt != "" {
@@ -92,9 +140,9 @@ func (c *OpenAIClient) StartChat(systemPrompt, model string) Chat {
 	}
 
 	return &openAIChatSession{
-		client:  c.client, // Pass the client from OpenAIClient
+		client:  c.client,
 		history: history,
-		model:   model,
+		model:   selectedModel,
 		// functionDefinitions and tools will be set later via SetFunctionDefinitions
 	}
 }
@@ -156,24 +204,9 @@ func (c *OpenAIClient) SetResponseSchema(schema *Schema) error {
 // Note: This may not work with all OpenAI-compatible providers if they don't fully implement
 // the Models.List endpoint or return data in a different format.
 func (c *OpenAIClient) ListModels(ctx context.Context) ([]string, error) {
-
-	var opts []option.RequestOption
-
-	endpoint := os.Getenv("OPENAI_ENDPOINT") // if another endpoint is used
-	if endpoint != "" {
-		opts = append(opts, option.WithBaseURL(endpoint))
-	}
-
-	res, err := c.client.Models.List(ctx, opts...)
+	res, err := c.client.Models.List(ctx)
 	if err != nil {
-
-		if endpoint != "" {
-			return nil, fmt.Errorf(`
-			There was an error in listing models from %s. 
-			Please verify if the endpoint used is fully OpenAI compatible`,
-				endpoint)
-		}
-		return nil, fmt.Errorf("There was an error in listing models from OpenAI")
+		return nil, fmt.Errorf("error listing models from OpenAI: %w", err)
 	}
 
 	modelsIDs := make([]string, 0, len(res.Data))
