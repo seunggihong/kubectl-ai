@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	openai "github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
@@ -267,7 +268,7 @@ func (cs *openAIChatSession) SetFunctionDefinitions(defs []*FunctionDefinition) 
 func (cs *openAIChatSession) Send(ctx context.Context, contents ...any) (ChatResponse, error) {
 	klog.V(1).InfoS("openAIChatSession.Send called", "model", cs.model, "history_len", len(cs.history))
 
-	// 1. Append user message(s) to history
+	// Append user message(s) to history
 	for _, content := range contents {
 		switch c := content.(type) {
 		case string:
@@ -289,7 +290,7 @@ func (cs *openAIChatSession) Send(ctx context.Context, contents ...any) (ChatRes
 		}
 	}
 
-	// 2. Prepare the API request
+	// Prepare the API request
 	chatReq := openai.ChatCompletionNewParams{
 		Model:    openai.ChatModel(cs.model),
 		Messages: cs.history,
@@ -299,7 +300,7 @@ func (cs *openAIChatSession) Send(ctx context.Context, contents ...any) (ChatRes
 		// chatReq.ToolChoice = openai.ToolChoiceAuto // Or specify if needed
 	}
 
-	// 3. Call the OpenAI API
+	// Call the OpenAI API
 	klog.V(1).InfoS("Sending request to OpenAI Chat API", "model", cs.model, "messages", len(chatReq.Messages), "tools", len(chatReq.Tools))
 	completion, err := cs.client.Chat.Completions.New(ctx, chatReq)
 	if err != nil {
@@ -309,7 +310,7 @@ func (cs *openAIChatSession) Send(ctx context.Context, contents ...any) (ChatRes
 	}
 	klog.V(1).InfoS("Received response from OpenAI Chat API", "id", completion.ID, "choices", len(completion.Choices))
 
-	// 4. Process the response
+	// Process the response
 	if len(completion.Choices) == 0 {
 		klog.Warning("Received response with no choices from OpenAI")
 		return nil, errors.New("received empty response from OpenAI (no choices)")
@@ -330,39 +331,149 @@ func (cs *openAIChatSession) Send(ctx context.Context, contents ...any) (ChatRes
 }
 
 // SendStreaming sends the user message(s) and returns an iterator for the LLM response stream.
-// NOTE: Due to limitations in the openai-go v0.1.0-beta.10 library, this function
-// simulates streaming by making a single non-streaming call and returning an iterator
-// that yields the single response. This satisfies the agent's interface requirement.
 func (cs *openAIChatSession) SendStreaming(ctx context.Context, contents ...any) (ChatResponseIterator, error) {
-	klog.V(1).InfoS("openAIChatSession.SendStreaming called (simulated)", "model", cs.model)
+	klog.V(1).InfoS("Starting OpenAI streaming request", "model", cs.model)
 
-	// Call the non-streaming Send method we implemented earlier
-	singleResponse, err := cs.Send(ctx, contents...)
-	if err != nil {
-		// Send already logs errors, just wrap it
-		return nil, fmt.Errorf("simulated streaming failed during non-streaming call: %w", err)
+	// Append user message(s) to history
+	for _, content := range contents {
+		switch c := content.(type) {
+		case string:
+			klog.V(2).Infof("Adding user message to history: %s", c)
+			cs.history = append(cs.history, openai.UserMessage(c))
+		case FunctionCallResult:
+			klog.V(2).Infof("Adding tool call result to history: Name=%s, ID=%s", c.Name, c.ID)
+			resultJSON, err := json.Marshal(c.Result)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal function call result %q: %w", c.Name, err)
+			}
+			cs.history = append(cs.history, openai.ToolMessage(string(resultJSON), c.ID))
+		default:
+			return nil, fmt.Errorf("unhandled content type: %T", content)
+		}
 	}
 
-	// Return an iterator function that yields the single response once.
-	var yielded bool
-	iteratorFunc := func(yield func(ChatResponse, error) bool) {
-		if !yielded {
-			yielded = true
-			// Yield the single response. If yield returns false, stop early.
-			if !yield(singleResponse, nil) {
+	// Prepare the API request
+	chatReq := openai.ChatCompletionNewParams{
+		Model:    openai.ChatModel(cs.model),
+		Messages: cs.history,
+	}
+	if len(cs.tools) > 0 {
+		chatReq.Tools = cs.tools
+	}
+
+	// Start the OpenAI streaming request
+	klog.V(1).InfoS("Sending streaming request to OpenAI API",
+		"model", cs.model,
+		"messageCount", len(chatReq.Messages),
+		"toolCount", len(chatReq.Tools))
+
+	stream := cs.client.Chat.Completions.NewStreaming(ctx, chatReq)
+
+	// Create an accumulator to track the full response
+	acc := openai.ChatCompletionAccumulator{}
+
+	// Create and return the stream iterator
+	return func(yield func(ChatResponse, error) bool) {
+		defer stream.Close()
+
+		var lastResponseChunk *openAIChatStreamResponse
+		var currentContent strings.Builder
+		var currentToolCalls []openai.ChatCompletionMessageToolCall
+
+		// Process stream chunks
+		for stream.Next() {
+			chunk := stream.Current()
+
+			// Update the accumulator with the new chunk
+			acc.AddChunk(chunk)
+
+			// Handle content completion
+			if _, ok := acc.JustFinishedContent(); ok {
+				klog.V(2).Info("Content stream finished")
+			}
+
+			// Handle refusal completion
+			if refusal, ok := acc.JustFinishedRefusal(); ok {
+				klog.V(2).Infof("Refusal stream finished: %v", refusal)
+				yield(nil, fmt.Errorf("model refused to respond: %v", refusal))
 				return
 			}
-		}
-		// Subsequent calls do nothing, effectively ending the stream.
-	}
 
-	return iteratorFunc, nil
+			// Handle tool call completion
+			if tool, ok := acc.JustFinishedToolCall(); ok {
+				klog.V(2).Infof("Tool call finished: %s %s", tool.Name, tool.Arguments)
+				currentToolCalls = append(currentToolCalls, openai.ChatCompletionMessageToolCall{
+					ID: tool.Id,
+					Function: openai.ChatCompletionMessageToolCallFunction{
+						Name:      tool.Name,
+						Arguments: tool.Arguments,
+					},
+				})
+			}
+
+			// Create a streaming response with proper nil checks
+			streamResponse := &openAIChatStreamResponse{
+				streamChunk: chunk,
+				accumulator: acc,
+				content:     "", // Default to empty content
+				toolCalls:   currentToolCalls,
+			}
+
+			// Only process content if there are choices and a delta
+			if len(chunk.Choices) > 0 {
+				delta := chunk.Choices[0].Delta
+				if delta.Content != "" {
+					currentContent.WriteString(delta.Content)
+					streamResponse.content = delta.Content // Only set content if there's new content
+				}
+			}
+
+			// Keep track of the last response for history
+			lastResponseChunk = &openAIChatStreamResponse{
+				streamChunk: chunk,
+				accumulator: acc,
+				content:     currentContent.String(), // Full accumulated content for history
+				toolCalls:   currentToolCalls,
+			}
+
+			// Only yield if there's actual content or tool calls to report
+			if streamResponse.content != "" || len(streamResponse.toolCalls) > 0 {
+				if !yield(streamResponse, nil) {
+					return
+				}
+			}
+		}
+
+		// Check for errors after streaming completes
+		if err := stream.Err(); err != nil {
+			klog.Errorf("Error in OpenAI streaming: %v", err)
+			yield(nil, fmt.Errorf("OpenAI streaming error: %w", err))
+			return
+		}
+
+		// Update conversation history with the complete message
+		if lastResponseChunk != nil {
+			completeMessage := openai.ChatCompletionMessage{
+				Content:   currentContent.String(),
+				Role:      "assistant",
+				ToolCalls: currentToolCalls,
+			}
+
+			// Append the full assistant response to history
+			cs.history = append(cs.history, completeMessage.ToParam())
+			klog.V(2).InfoS("Added complete assistant message to history",
+				"content_present", completeMessage.Content != "",
+				"tool_calls", len(completeMessage.ToolCalls))
+		}
+	}, nil
 }
 
-// IsRetryableError returns false for now.
+// IsRetryableError determines if an error from the OpenAI API should be retried.
 func (cs *openAIChatSession) IsRetryableError(err error) bool {
-	// TODO: Implement actual retry logic if needed
-	return false
+	if err == nil {
+		return false
+	}
+	return DefaultIsRetryableError(err)
 }
 
 // --- Helper structs for ChatResponse interface ---
@@ -445,8 +556,9 @@ func (p *openAIPart) AsFunctionCalls() ([]FunctionCall, bool) {
 		return nil, false
 	}
 
-	gollmCalls := make([]FunctionCall, len(p.toolCalls))
-	for i, tc := range p.toolCalls {
+	// Convert only complete function calls
+	var completeCalls []FunctionCall
+	for _, tc := range p.toolCalls {
 		// Check if it's a function call by seeing if Function Name is populated
 		if tc.Function.Name == "" { // Adjusted check for function calls
 			klog.V(2).Infof("Skipping non-function tool call ID: %s", tc.ID)
@@ -456,11 +568,117 @@ func (p *openAIPart) AsFunctionCalls() ([]FunctionCall, bool) {
 		// Attempt to unmarshal arguments, ignore error for now if it fails
 		_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
 
-		gollmCalls[i] = FunctionCall{
+		completeCalls = append(completeCalls, FunctionCall{
 			ID:        tc.ID, // Pass the Tool Call ID
 			Name:      tc.Function.Name,
 			Arguments: args,
+		})
+	}
+	return completeCalls, true
+}
+
+// Update openAIChatStreamResponse to include accumulated content
+type openAIChatStreamResponse struct {
+	streamChunk openai.ChatCompletionChunk
+	accumulator openai.ChatCompletionAccumulator
+	content     string
+	toolCalls   []openai.ChatCompletionMessageToolCall
+}
+
+// Update Candidates() to use accumulated content
+func (r *openAIChatStreamResponse) Candidates() []Candidate {
+	if len(r.streamChunk.Choices) == 0 {
+		return nil
+	}
+
+	candidates := make([]Candidate, len(r.streamChunk.Choices))
+	for i, choice := range r.streamChunk.Choices {
+		candidates[i] = &openAIStreamCandidate{
+			streamChoice: choice,
+			content:      r.content,
+			toolCalls:    r.toolCalls,
 		}
 	}
-	return gollmCalls, true
+	return candidates
+}
+
+// Update openAIStreamCandidate to handle delta content
+type openAIStreamCandidate struct {
+	streamChoice openai.ChatCompletionChunkChoice
+	content      string // This will now be just the delta content
+	toolCalls    []openai.ChatCompletionMessageToolCall
+}
+
+// Update Parts() to handle delta content
+func (c *openAIStreamCandidate) Parts() []Part {
+	var parts []Part
+
+	// Only include the delta content
+	if c.content != "" {
+		parts = append(parts, &openAIStreamPart{
+			content: c.content,
+		})
+	}
+
+	// Include accumulated tool calls
+	if len(c.toolCalls) > 0 {
+		parts = append(parts, &openAIStreamPart{
+			toolCalls: c.toolCalls,
+		})
+	}
+
+	return parts
+}
+
+// Add UsageMetadata implementation
+func (r *openAIChatStreamResponse) UsageMetadata() any {
+	if r.accumulator.Usage.TotalTokens > 0 {
+		return r.accumulator.Usage
+	}
+	return nil
+}
+
+// Add String implementation
+func (c *openAIStreamCandidate) String() string {
+	return fmt.Sprintf("StreamingCandidate(Content: %q, ToolCalls: %d)",
+		c.content, len(c.toolCalls))
+}
+
+// Define openAIStreamPart
+type openAIStreamPart struct {
+	content   string
+	toolCalls []openai.ChatCompletionMessageToolCall
+}
+
+// Ensure openAIStreamPart implements Part interface
+var _ Part = (*openAIStreamPart)(nil)
+
+func (p *openAIStreamPart) AsText() (string, bool) {
+	return p.content, p.content != ""
+}
+
+func (p *openAIStreamPart) AsFunctionCalls() ([]FunctionCall, bool) {
+	if len(p.toolCalls) == 0 {
+		return nil, false
+	}
+
+	calls := make([]FunctionCall, 0, len(p.toolCalls))
+	for _, tc := range p.toolCalls {
+		var args map[string]any
+		if tc.Function.Arguments != "" {
+			if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+				klog.V(2).Infof("Error unmarshalling function arguments: %v", err)
+				args = make(map[string]any)
+			}
+		} else {
+			args = make(map[string]any)
+		}
+
+		calls = append(calls, FunctionCall{
+			ID:        tc.ID,
+			Name:      tc.Function.Name,
+			Arguments: args,
+		})
+	}
+	return calls, true
 }

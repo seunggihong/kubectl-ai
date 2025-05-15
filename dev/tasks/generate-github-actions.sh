@@ -53,7 +53,8 @@ EOF
 
 
 for f in $(find dev/ci/presubmits -type f | sort ); do
-    name=$(basename ${f})
+    filename=$(basename ${f})
+    name="${filename%.*}"
 
 cat >> ${REPO_ROOT}/.github/workflows/ci-presubmit.yaml <<EOF
 

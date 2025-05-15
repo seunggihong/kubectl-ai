@@ -21,11 +21,11 @@ set -o pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd ${REPO_ROOT}
 
-dev/tasks/generate-github-actions
+dev/tasks/format.sh
 
 changes=$(git status --porcelain)
 if [[ -n "${changes}" ]]; then
-  echo "FAIL: Changes detected from dev/tasks/generate-github-actions:"
+  echo "FAIL: Changes detected from dev/tasks/format.sh:"
   git diff | head -n60
   echo "${changes}"
   exit 1

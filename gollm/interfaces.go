@@ -48,7 +48,7 @@ type Chat interface {
 	// you do not need to "replay" any messages from the LLM.
 	Send(ctx context.Context, contents ...any) (ChatResponse, error)
 
-	// SendStreaming is the streaming verison of Send.
+	// SendStreaming is the streaming version of Send.
 	SendStreaming(ctx context.Context, contents ...any) (ChatResponseIterator, error)
 
 	// SetFunctionDefinitions configures the set of tools (functions) available to the LLM

@@ -37,9 +37,9 @@ type TerminalUI struct {
 	subscription io.Closer
 
 	// Input handling fields (initialized once)
-	rlInstance *readline.Instance // For readline input
-	ttyFile    *os.File           // For TTY input
-	ttyReader  *bufio.Reader      // For TTY input
+	rlInstance        *readline.Instance // For readline input
+	ttyFile           *os.File           // For TTY input
+	ttyReaderInstance *bufio.Reader      // For TTY input
 
 	// currentBlock is the block we are rendering
 	currentBlock Block
@@ -70,40 +70,49 @@ func NewTerminalUI(doc *Document, journal journal.Recorder, useTTYForInput bool)
 		useTTYForInput:   useTTYForInput, // Store this flag
 	}
 
-	// Initialize input handler based on mode
-	if useTTYForInput {
-		// Initialize TTY input
-		tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
-		if err != nil {
-			return nil, fmt.Errorf("opening tty for input: %w", err)
-		}
-		u.ttyFile = tty // Store file handle for closing
-		u.ttyReader = bufio.NewReader(tty)
-	} else {
-		// Initialize readline input
-		historyPath := filepath.Join(os.TempDir(), "kubectl-ai-history")
-		rl, err := readline.NewEx(&readline.Config{
-			Prompt:      ">>> ", // Default prompt for main input
-			Stdin:       os.Stdin,
-			Stdout:      os.Stdout,
-			Stderr:      os.Stderr,
-			HistoryFile: historyPath,
-			// History enabled by default
-		})
-		if err != nil {
-			// Log warning or fallback if readline init fails?
-			klog.Warningf("Failed to initialize readline, input might be limited: %v", err)
-			// Proceed without readline for now, or return error?
-			// Returning error to make it explicit
-			return nil, fmt.Errorf("creating readline instance: %w", err)
-		}
-		u.rlInstance = rl // Store readline instance
-	}
-
 	subscription := doc.AddSubscription(u)
 	u.subscription = subscription
 
 	return u, nil
+}
+
+func (u *TerminalUI) ttyReader() (*bufio.Reader, error) {
+	if u.ttyReaderInstance != nil {
+		return u.ttyReaderInstance, nil
+	}
+	// Initialize TTY input
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		return nil, fmt.Errorf("opening tty for input: %w", err)
+	}
+	u.ttyFile = tty // Store file handle for closing
+	u.ttyReaderInstance = bufio.NewReader(tty)
+	return u.ttyReaderInstance, nil
+}
+
+func (u *TerminalUI) readlineInstance() (*readline.Instance, error) {
+	if u.rlInstance != nil {
+		return u.rlInstance, nil
+	}
+	// Initialize readline input
+	historyPath := filepath.Join(os.TempDir(), "kubectl-ai-history")
+	rl, err := readline.NewEx(&readline.Config{
+		Prompt:      ">>> ", // Default prompt for main input
+		Stdin:       os.Stdin,
+		Stdout:      os.Stdout,
+		Stderr:      os.Stderr,
+		HistoryFile: historyPath,
+		// History enabled by default
+	})
+	if err != nil {
+		// Log warning or fallback if readline init fails?
+		klog.Warningf("Failed to initialize readline, input might be limited: %v", err)
+		// Proceed without readline for now, or return error?
+		// Returning error to make it explicit
+		return nil, fmt.Errorf("creating readline instance: %w", err)
+	}
+	u.rlInstance = rl // Store readline instance
+	return u.rlInstance, nil
 }
 
 func (u *TerminalUI) Close() error {
@@ -165,32 +174,27 @@ func (u *TerminalUI) DocumentChanged(doc *Document, block Block) {
 		streaming = block.Streaming()
 	case *InputTextBlock:
 		var query string
-		var err error
-
 		if u.useTTYForInput {
-			// Use pre-initialized TTY reader
-			if u.ttyReader == nil {
+			tReader, err := u.ttyReader()
+			if err != nil {
 				block.Observable().Set("", fmt.Errorf("TTY reader not initialized"))
 				return
 			}
 			fmt.Print("\n>>> ") // Print prompt manually
-			query, err = u.ttyReader.ReadString('\n')
+			query, err = tReader.ReadString('\n')
 			if err != nil {
 				block.Observable().Set("", err) // Set error (includes io.EOF)
 			} else {
 				block.Observable().Set(query, nil)
 			}
 		} else {
-			// Use pre-initialized readline instance
-			if u.rlInstance == nil {
-				// This case might happen if readline init failed in NewTerminalUI
-				// Maybe fallback to basic bufio reading?
-				// For now, return error
-				block.Observable().Set("", fmt.Errorf("readline instance not initialized"))
+			rlInstance, err := u.readlineInstance()
+			if err != nil {
+				block.Observable().Set("", fmt.Errorf("error creating readline instance: %w", err))
 				return
 			}
-			u.rlInstance.SetPrompt(">>> ") // Ensure correct prompt
-			query, err = u.rlInstance.Readline()
+			rlInstance.SetPrompt(">>> ") // Ensure correct prompt
+			query, err = rlInstance.Readline()
 			if err != nil {
 				if err == readline.ErrInterrupt { // Handle Ctrl+C
 					block.Observable().Set("", io.EOF)
@@ -209,14 +213,14 @@ func (u *TerminalUI) DocumentChanged(doc *Document, block Block) {
 		fmt.Printf("%s\n", block.Prompt) // Print initial prompt text
 
 		if u.useTTYForInput {
-			// Use pre-initialized TTY reader
-			if u.ttyReader == nil {
+			tReader, err := u.ttyReader()
+			if err != nil {
 				block.Observable().Set("", fmt.Errorf("TTY reader not initialized"))
 				return
 			}
 			for {
 				fmt.Print("  Enter your choice (number): ") // Print loop prompt manually
-				response, err := u.ttyReader.ReadString('\n')
+				response, err := tReader.ReadString('\n')
 				if err != nil {
 					block.Observable().Set("", err)
 					return
@@ -229,20 +233,20 @@ func (u *TerminalUI) DocumentChanged(doc *Document, block Block) {
 				fmt.Printf("  Invalid choice. Please enter one of: %s\n", strings.Join(block.Options, ", "))
 			}
 		} else {
-			// Use pre-initialized readline instance
-			if u.rlInstance == nil {
-				block.Observable().Set("", fmt.Errorf("readline instance not initialized"))
+			rlInstance, err := u.readlineInstance()
+			if err != nil {
+				block.Observable().Set("", fmt.Errorf("readline instance not initialized: %w", err))
 				return
 			}
 			// Temporarily change prompt for option selection
-			originalPrompt := u.rlInstance.Config.Prompt
+			originalPrompt := rlInstance.Config.Prompt
 			choicePrompt := "  Enter your choice (number): "
-			u.rlInstance.SetPrompt(choicePrompt)
+			rlInstance.SetPrompt(choicePrompt)
 			// Ensure original prompt is restored even if errors occur
-			defer u.rlInstance.SetPrompt(originalPrompt)
+			defer rlInstance.SetPrompt(originalPrompt)
 
 			for {
-				response, err := u.rlInstance.Readline()
+				response, err := rlInstance.Readline()
 				if err != nil {
 					if err == readline.ErrInterrupt { // Handle Ctrl+C
 						block.Observable().Set("", io.EOF)
