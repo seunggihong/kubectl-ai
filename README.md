@@ -22,6 +22,10 @@ First, ensure that kubectl is installed and configured.
 curl -sSL https://raw.githubusercontent.com/GoogleCloudPlatform/kubectl-ai/main/install.sh | bash
 ```
 
+<details>
+
+<summary>Other Installation Methods</summary>
+
 #### Manual Installation (Linux, MacOS and Windows)
 
 1. Download the latest release from the [releases page](https://github.com/GoogleCloudPlatform/kubectl-ai/releases/latest) for your target machine.
@@ -41,8 +45,11 @@ Then you can install with krew
 kubectl krew install ai
 ```
 Now you can invoke `kubectl-ai` as a kubectl plugin like this: `kubectl ai`.
+</details>
 
 ### Usage
+
+`kubectl-ai` supports AI models from `gemini`, `vertexai`, `azopenai`, `openai`, `grok` and local LLM providers such as `ollama` and `llama.cpp`.
 
 #### Using Gemini (Default)
 
@@ -58,6 +65,10 @@ kubectl-ai --model gemini-2.5-pro-exp-03-25
 # Use 2.5 flash (faster) model
 kubectl-ai --quiet --model gemini-2.5-flash-preview-04-17 "check logs for nginx app in hello namespace"
 ```
+
+<details>
+
+<summary>Use other AI models</summary>
 
 #### Using AI models running locally (ollama or llama.cpp)
 
@@ -119,8 +130,7 @@ export OPENAI_API_KEY=your_openai_api_key_here
 export OPENAI_ENDPOINT=https://dashscope.aliyuncs.com/compatible-mode/v1
 kubectl-ai --llm-provider=openai --model=qwen-plus
 ```
-
-* Note: `kubectl-ai` supports AI models from `gemini`, `vertexai`, `azopenai`, `openai`, `grok` and local LLM providers such as `ollama` and `llama.cpp`.
+</details>
 
 Run interactively:
 
@@ -150,6 +160,27 @@ You can even combine a positional argument with stdin input. The positional argu
 cat error.log | kubectl-ai "explain the error"
 ```
 
+## Tools
+
+`kubectl-ai` leverages LLMs to suggest and execute Kubernetes operations using a set of powerful tools. It comes with built-in tools like `kubectl`, `bash`, and `trivy`.
+
+You can also extend its capabilities by defining your own custom tools. By default, `kubectl-ai` looks for your tool configurations in `~/.config/kubectl-ai/tools.yaml`.
+
+To specify a different configuration file, use:
+
+```shell
+kubectl-ai --custom-tools-config=YOUR_CONFIG
+```
+
+Define your custom tools using the following schema. You can include multiple tools in a single configuration file:
+
+```yaml
+- name: tool_name
+  description: "A clear description that helps the LLM understand when to use this tool."
+  command: "your_command" # For example: 'gcloud' or 'gcloud container clusters'
+  command_desc: "Detailed information for the LLM, including command syntax and usage examples."
+```
+
 ## Extras
 
 You can use the following special keywords for specific actions:
@@ -163,29 +194,7 @@ You can use the following special keywords for specific actions:
 
 ### Invoking as kubectl plugin
 
-Use it via the `kubectl` plug interface like this: `kubectl ai`.  kubectl will find `kubectl-ai` as long as it's in your PATH.  For more information about plugins please see: https://kubernetes.io/docs/tasks/extend-kubectl/kubectl-plugins/
-
-
-### Examples
-
-```bash
-# Get information about pods in the default namespace
-kubectl-ai --quiet "show me all pods in the default namespace"
-
-# Create a new deployment
-kubectl-ai --quiet "create a deployment named nginx with 3 replicas using the nginx:latest image"
-
-# Troubleshoot issues
-kubectl-ai --quiet "double the capacity for the nginx app"
-
-# Using Azure OpenAI instead of Gemini
-kubectl-ai --llm-provider=azopenai --model=your_azure_openai_deployment_name_here --quiet "scale the nginx deployment to 5 replicas"
-
-# Using OpenAI instead of Gemini
-kubectl-ai --llm-provider=openai --model=gpt-4.1 --quiet "scale the nginx deployment to 5 replicas"
-```
-
-The `kubectl-ai` will process your query, execute the appropriate kubectl commands, and provide you with the results and explanations.
+You can also run `kubectl ai`. `kubectl` finds any executable file in your `PATH` whose name begins with `kubectl-` as a [plugin](https://kubernetes.io/docs/tasks/extend-kubectl/kubectl-plugins/).
 
 ## MCP server
 
